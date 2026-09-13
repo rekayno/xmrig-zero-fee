@@ -1,0 +1,317 @@
+name: Build (zero-fee)
+
+# Fork with automatic builds.
+# IMPORTANT: dev fee is set to 0 ONLY here in CI (runtime patch).
+# No files under src/ are modified in git, so `git merge upstream/master`
+# stays conflict-free. See FORK.md.
+#
+# Triggers:
+# - every push / PR -> build + upload artifacts (no release)
+# - tags like v6.26.0-zero1 -> build + create GitHub Release with binaries
+
+on:
+  push:
+    branches: ["**"]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CMAKE_BUILD_TYPE: Release
+
+jobs:
+  build-linux:
+    name: Linux x64
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Zero dev fee (CI-only patch, keeps fork merge-clean)
+        # Runs on the ephemeral runner workspace only. Nothing is committed,
+        # so merging upstream never conflicts.
+        shell: python
+        run: |
+          import pathlib, re, sys
+          root = pathlib.Path(".")
+          jobs = {
+              "src/donate.h": [
+                  (r"constexpr const int kDefaultDonateLevel\s*=\s*\d+\s*;", "constexpr const int kDefaultDonateLevel = 0;"),
+                  (r"constexpr const int kMinimumDonateLevel\s*=\s*\d+\s*;", "constexpr const int kMinimumDonateLevel = 0;"),
+              ],
+              "src/core/config/Config_default.h": [
+                  (r'"donate-level":\s*\d+', '"donate-level": 0'),
+              ],
+              "src/config.json": [
+                  (r'"donate-level":\s*\d+', '"donate-level": 0'),
+              ],
+          }
+          failed = False
+          for rel, subs in jobs.items():
+              p = root / rel
+              if not p.exists():
+                  print(f"::warning::{rel} not found, skipping")
+                  continue
+              text = p.read_text(encoding="utf-8", errors="strict")
+              orig = text
+              for pat, repl in subs:
+                  text, n = re.subn(pat, repl, text)
+                  print(f"{rel}: /{pat}/ -> {n} replacement(s)")
+                  if n == 0:
+                      print(f"::warning::{rel}: pattern not found: {pat}")
+              if text != orig:
+                  p.write_text(text, encoding="utf-8")
+                  print(f"patched {rel}")
+          # ---- verify (fail fast if upstream refactored fee code) ----
+          donate = (root / "src/donate.h").read_text()
+          assert "kDefaultDonateLevel = 0;" in donate, "kDefaultDonateLevel was not set to 0"
+          assert "kMinimumDonateLevel = 0;" in donate, "kMinimumDonateLevel was not set to 0"
+          print("---- src/donate.h ----")
+          print(donate)
+          print("zero-fee patch OK")
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y git build-essential cmake libuv1-dev libssl-dev libhwloc-dev
+
+      - name: Configure
+        run: |
+          mkdir -p build
+          cd build
+          cmake .. -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build
+        run: |
+          cmake --build build -- -j$(nproc)
+
+      - name: Verify binary
+        run: |
+          ./build/xmrig --version
+          echo "--- donate files in workspace (patched, not committed) ---"
+          grep -rn "kDefaultDonateLevel\|kMinimumDonateLevel" src/donate.h
+          echo "--- git status (src/ must be clean) ---"
+          git status --short
+          test -z "$(git status --short -- src/)" && echo "OK: no src/ changes committed/tracked" || (echo "::error::src/ was modified on disk (expected only in CI workspace, but this check ensures patch step did not create stray files)"; git diff -- src/ | head -n 100)
+
+      - name: Package
+        run: |
+          mkdir -p dist upload
+          cp build/xmrig dist/
+          tar -czvf upload/xmrig-linux-x64.tar.gz -C dist xmrig
+          ls -lh upload/
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: xmrig-linux-x64
+          path: upload/
+          if-no-files-found: error
+
+  build-windows:
+    name: Windows x64 (MSVC 2026)
+    runs-on: windows-2025
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Zero dev fee (CI-only patch, keeps fork merge-clean)
+        shell: python
+        run: |
+          import pathlib, re, sys
+          root = pathlib.Path(".")
+          jobs = {
+              "src/donate.h": [
+                  (r"constexpr const int kDefaultDonateLevel\s*=\s*\d+\s*;", "constexpr const int kDefaultDonateLevel = 0;"),
+                  (r"constexpr const int kMinimumDonateLevel\s*=\s*\d+\s*;", "constexpr const int kMinimumDonateLevel = 0;"),
+              ],
+              "src/core/config/Config_default.h": [
+                  (r'"donate-level":\s*\d+', '"donate-level": 0'),
+              ],
+              "src/config.json": [
+                  (r'"donate-level":\s*\d+', '"donate-level": 0'),
+              ],
+          }
+          for rel, subs in jobs.items():
+              p = root / rel
+              if not p.exists():
+                  print(f"::warning::{rel} not found, skipping")
+                  continue
+              text = p.read_text(encoding="utf-8", errors="strict")
+              orig = text
+              for pat, repl in subs:
+                  text, n = re.subn(pat, repl, text)
+                  print(f"{rel}: /{pat}/ -> {n} replacement(s)")
+                  if n == 0:
+                      print(f"::warning::{rel}: pattern not found: {pat}")
+              if text != orig:
+                  p.write_text(text, encoding="utf-8")
+                  print(f"patched {rel}")
+          donate = (root / "src/donate.h").read_text()
+          assert "kDefaultDonateLevel = 0;" in donate, "kDefaultDonateLevel was not set to 0"
+          assert "kMinimumDonateLevel = 0;" in donate, "kMinimumDonateLevel was not set to 0"
+          print(donate)
+          print("zero-fee patch OK")
+
+      - name: Get xmrig-deps (MSVC 2022 x64 libs, VS2026 compat)
+        shell: pwsh
+        run: |
+          if (Test-Path C:/xmrig-deps) { Remove-Item -Recurse -Force C:/xmrig-deps }
+          git clone --depth 1 --filter=blob:none --sparse https://github.com/xmrig/xmrig-deps.git C:/xmrig-deps
+          git -C C:/xmrig-deps sparse-checkout set msvc2022/x64
+          git -C C:/xmrig-deps checkout
+          Get-ChildItem C:/xmrig-deps/msvc2022/x64
+
+      - name: Configure (Visual Studio 18 2026, x64)
+        shell: pwsh
+        run: |
+          mkdir build
+          cd build
+          cmake .. -G "Visual Studio 18 2026" -A x64 -DXMRIG_DEPS=C:/xmrig-deps/msvc2022/x64
+
+      - name: Build
+        shell: pwsh
+        run: cmake --build build --config Release -- /m
+
+      - name: Verify binary
+        shell: pwsh
+        run: |
+          Get-Content src/donate.h
+          & ./build/Release/xmrig.exe --version
+          git status --short
+
+      - name: Package
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist, upload | Out-Null
+          Copy-Item build/Release/xmrig.exe dist/
+          if (Test-Path build/Release/WinRing0x64.sys) { Copy-Item build/Release/WinRing0x64.sys dist/ }
+          Compress-Archive -Path dist/* -DestinationPath upload/xmrig-windows-x64.zip -Force
+          Get-ChildItem upload/
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: xmrig-windows-x64
+          path: upload/
+          if-no-files-found: error
+
+  build-macos:
+    name: macOS arm64
+    runs-on: macos-26
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Zero dev fee (CI-only patch, keeps fork merge-clean)
+        shell: python
+        run: |
+          import pathlib, re, sys
+          root = pathlib.Path(".")
+          jobs = {
+              "src/donate.h": [
+                  (r"constexpr const int kDefaultDonateLevel\s*=\s*\d+\s*;", "constexpr const int kDefaultDonateLevel = 0;"),
+                  (r"constexpr const int kMinimumDonateLevel\s*=\s*\d+\s*;", "constexpr const int kMinimumDonateLevel = 0;"),
+              ],
+              "src/core/config/Config_default.h": [
+                  (r'"donate-level":\s*\d+', '"donate-level": 0'),
+              ],
+              "src/config.json": [
+                  (r'"donate-level":\s*\d+', '"donate-level": 0'),
+              ],
+          }
+          for rel, subs in jobs.items():
+              p = root / rel
+              if not p.exists():
+                  print(f"::warning::{rel} not found, skipping")
+                  continue
+              text = p.read_text(encoding="utf-8", errors="strict")
+              orig = text
+              for pat, repl in subs:
+                  text, n = re.subn(pat, repl, text)
+                  print(f"{rel}: /{pat}/ -> {n} replacement(s)")
+                  if n == 0:
+                      print(f"::warning::{rel}: pattern not found: {pat}")
+              if text != orig:
+                  p.write_text(text, encoding="utf-8")
+                  print(f"patched {rel}")
+          donate = (root / "src/donate.h").read_text()
+          assert "kDefaultDonateLevel = 0;" in donate, "kDefaultDonateLevel was not set to 0"
+          assert "kMinimumDonateLevel = 0;" in donate, "kMinimumDonateLevel was not set to 0"
+          print(donate)
+          print("zero-fee patch OK")
+
+      - name: Install dependencies
+        run: |
+          brew update
+          brew install cmake libuv openssl@3 hwloc
+
+      - name: Configure
+        run: |
+          mkdir -p build
+          cd build
+          cmake .. -DCMAKE_BUILD_TYPE=Release -DOPENSSL_ROOT_DIR=$(brew --prefix openssl@3)
+
+      - name: Build
+        run: |
+          cmake --build build -- -j$(sysctl -n hw.ncpu)
+
+      - name: Verify binary
+        run: |
+          ./build/xmrig --version
+          grep -rn "kDefaultDonateLevel\|kMinimumDonateLevel" src/donate.h
+          git status --short
+
+      - name: Package
+        run: |
+          mkdir -p dist upload
+          cp build/xmrig dist/
+          tar -czvf upload/xmrig-macos-arm64.tar.gz -C dist xmrig
+          ls -lh upload/
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: xmrig-macos-arm64
+          path: upload/
+          if-no-files-found: error
+
+  release:
+    name: Release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [build-linux, build-windows, build-macos]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v8
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: List files
+        run: |
+          ls -lR dist
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v3
+        with:
+          files: dist/**/*
+          generate_release_notes: true
+          body: |
+            Zero-fee build of ${{ github.ref_name }}.
+
+            - Dev fee (`donate-level`) defaults to `0` and minimum is `0`.
+            - Patch is applied **only in CI** (`src/donate.h` etc. are never modified in git), so this fork merges cleanly with upstream xmrig/xmrig.
+            - See `FORK.md` for details and merge instructions.
